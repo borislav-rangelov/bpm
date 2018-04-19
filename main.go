@@ -10,15 +10,11 @@ import (
 	"go/token"
 	"io/ioutil"
 	"log"
-	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
-
-	"github.com/borislav-rangelov/gonet"
-	"github.com/gorilla/mux"
 )
 
 const dependencyFilename = "bpm.json"
@@ -26,12 +22,6 @@ const vendorFolderName = "vendor"
 const gitFolderName = ".git"
 
 func main() {
-
-	r := mux.NewRouter()
-	r.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		err := gonet.Error{}
-		fmt.Print(err)
-	})
 	ex, _ := os.Executable()
 
 	initCommand := flag.NewFlagSet("init", flag.ExitOnError)
@@ -194,7 +184,7 @@ func getAllSourceFiles(dir string) *[]string {
 }
 
 func getImports(arr []*ast.ImportSpec) *[]string {
-	pattern, err := regexp.Compile("^[^/]+\\.[^.]{1,6}/[^/]+/[^/]+")
+	pattern, err := regexp.Compile("^([^/]+\\.[^.]{1,6}/[^/]+/[^/]+)")
 	if err != nil {
 		log.Panic(err)
 	}
@@ -203,7 +193,9 @@ func getImports(arr []*ast.ImportSpec) *[]string {
 
 	for _, i := range arr {
 		val := (*i.Path).Value
+		val = strings.Trim(val, `"`)
 		if pattern.MatchString(val) {
+			val = pattern.FindString(val)
 			if _, ok := imports[val]; !ok {
 				log.Printf("Found package: %s", val)
 				imports[val] = nil
