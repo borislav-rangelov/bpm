@@ -10,11 +10,14 @@ import (
 	"go/token"
 	"io/ioutil"
 	"log"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
+
+	"github.com/gorilla/mux"
 )
 
 const dependencyFilename = "bpm.json"
@@ -22,6 +25,11 @@ const vendorFolderName = "vendor"
 const gitFolderName = ".git"
 
 func main() {
+
+	r := mux.NewRouter()
+	r.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+
+	})
 	ex, _ := os.Executable()
 
 	initCommand := flag.NewFlagSet("init", flag.ExitOnError)
@@ -49,29 +57,34 @@ func main() {
 		init    = initCommand.Parsed()
 		install = installCommand.Parsed()
 		rebuild = rebuildCommand.Parsed()
-		dir     = flag.String("dir", "", "Root dir of project. Would pull all dependencies in $dir/vendor.")
+		pDir    = flag.String("dir", "", "Root dir of project. Would pull all dependencies in $dir/vendor.")
 	)
 
 	flag.Parse()
 
 	if init {
-		doInit(filepath.Dir(ex))
+		if *pDir == "" {
+			*pDir = filepath.Dir(ex)
+		}
+		doInit(*pDir)
 		return
 	}
 
-	if *dir == "" {
-		dir = findPackageFile(filepath.Dir(ex))
-		if dir == nil {
-			log.Panicf("No git repository found in folder or parent folders.\n")
-		}
-	}
-
-	log.Printf("Working dir: %s\n", *dir)
+	log.Printf("Working dir: %s\n", *pDir)
 
 	if install {
-		doInstall(*dir)
+		if *pDir == "" {
+			pDir = findPackageFile(filepath.Dir(ex))
+			if pDir == nil {
+				log.Panicf("No bpm.json repository found in folder or parent folders.\n")
+			}
+		}
+		doInstall(*pDir)
 	} else if rebuild {
-		doRebuild(*dir)
+		if *pDir == "" {
+			*pDir = filepath.Dir(ex)
+		}
+		doRebuild(*pDir)
 	} else {
 		showHelp()
 	}
@@ -240,8 +253,7 @@ func installPackages(packages []*string, dir string) map[string]*bpmEntry {
 
 func removeDir(dir string) {
 	if fileExists(dir) {
-		err := os.RemoveAll(dir)
-		if err != nil {
+		if err := os.RemoveAll(dir); err != nil {
 			log.Fatal(err)
 		}
 	}
