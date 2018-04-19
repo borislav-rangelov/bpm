@@ -17,6 +17,7 @@ import (
 	"regexp"
 	"strings"
 
+	"github.com/borislav-rangelov/gonet"
 	"github.com/gorilla/mux"
 )
 
@@ -28,7 +29,8 @@ func main() {
 
 	r := mux.NewRouter()
 	r.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-
+		err := gonet.Error{}
+		fmt.Print(err)
 	})
 	ex, _ := os.Executable()
 
@@ -163,7 +165,7 @@ func getAllImports(files *[]string) []*ast.ImportSpec {
 }
 
 func getAllSourceFiles(dir string) *[]string {
-	result := []string{}
+	result := make([]string, 0)
 
 	files, err := ioutil.ReadDir(dir)
 	if err != nil {
@@ -177,7 +179,10 @@ func getAllSourceFiles(dir string) *[]string {
 				log.Printf("Skipping vendor folder: %s\n", fullName)
 				continue
 			}
-			result = append(result, *getAllSourceFiles(fullName)...)
+			sources := getAllSourceFiles(fullName)
+			if len(*sources) > 0 {
+				result = append(result, *sources...)
+			}
 			continue
 		}
 		if strings.HasSuffix(fullName, ".go") {
@@ -185,12 +190,11 @@ func getAllSourceFiles(dir string) *[]string {
 			result = append(result, fullName)
 		}
 	}
-
 	return &result
 }
 
-func getImports(arr []*ast.ImportSpec) []*string {
-	pattern, err := regexp.Compile("[^/]+\\.[^.]{1,6}/[^/]+/[^/]+")
+func getImports(arr []*ast.ImportSpec) *[]string {
+	pattern, err := regexp.Compile("^[^/]+\\.[^.]{1,6}/[^/]+/[^/]+")
 	if err != nil {
 		log.Panic(err)
 	}
@@ -207,12 +211,12 @@ func getImports(arr []*ast.ImportSpec) []*string {
 		}
 	}
 
-	result := make([]*string, len(imports))
+	result := make([]string, 0)
 	for key := range imports {
 		key = strings.Trim(key, `"`)
-		result = append(result, &key)
+		result = append(result, key)
 	}
-	return result
+	return &result
 }
 
 type bpmEntry struct {
@@ -222,33 +226,55 @@ type bpmEntry struct {
 	Dependencies map[string]*bpmEntry `json:"dependencies"`
 }
 
-func installPackages(packages []*string, dir string) map[string]*bpmEntry {
+type channelResult struct {
+	pkg   string
+	entry *bpmEntry
+}
+
+func installPackages(packages *[]string, dir string) map[string]*bpmEntry {
 	vendorDir := filepath.Join(dir, vendorFolderName)
 	createDir(vendorDir)
 
-	dependencies := make(map[string]*bpmEntry, len(packages))
+	dependencies := make(map[string]*bpmEntry, len(*packages))
 
-	for _, f := range packages {
-		if f == nil {
-			continue
+	channelLis := []chan channelResult{}
+
+	for _, filename := range *packages {
+
+		pkgDir := filepath.Join(vendorDir, filepath.FromSlash(filename))
+		createDir(pkgDir)
+
+		c := make(chan channelResult, 1)
+		go pullAndGetEntry(c, filename, pkgDir)
+		channelLis = append(channelLis, c)
+	}
+
+	for _, c := range channelLis {
+		result, ok := <-c
+		if ok {
+			log.Printf("Dependency pulled: %s", result.pkg)
+			dependencies[result.pkg] = result.entry
 		}
-
-		pkgDir := filepath.Join(vendorDir, filepath.FromSlash(*f))
-		cloneURL := "https://" + *f
-
-		log.Printf("Pulling package %s in %s...", cloneURL, pkgDir)
-		log.Println(cloneRepo(cloneURL, pkgDir))
-
-		branch := getCurrentBranch(pkgDir)
-		hash := getCurrentCommitHash(pkgDir)
-
-		dependencies[*f] = &bpmEntry{
-			URL:    cloneURL,
-			Branch: branch,
-			Commit: hash}
 	}
 
 	return dependencies
+}
+
+func pullAndGetEntry(c chan channelResult, pkg string, pkgDir string) {
+	cloneURL := "https://" + pkg
+
+	log.Printf("Pulling package %s in %s...", cloneURL, pkgDir)
+	log.Println(cloneRepo(cloneURL, pkgDir))
+
+	branch := getCurrentBranch(pkgDir)
+	hash := getCurrentCommitHash(pkgDir)
+
+	c <- channelResult{
+		pkg: pkg,
+		entry: &bpmEntry{
+			URL:    cloneURL,
+			Branch: branch,
+			Commit: hash}}
 }
 
 func removeDir(dir string) {
@@ -261,7 +287,7 @@ func removeDir(dir string) {
 
 func createDir(dir string) {
 	if !fileExists(dir) {
-		err := os.Mkdir(dir, os.ModePerm)
+		err := os.MkdirAll(dir, os.ModePerm)
 		if err != nil {
 			log.Fatal(err)
 		}
