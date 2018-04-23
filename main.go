@@ -3,7 +3,6 @@ package main
 import (
 	"bytes"
 	"encoding/json"
-	"flag"
 	"fmt"
 	"go/ast"
 	"go/parser"
@@ -15,6 +14,8 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+
+	"github.com/borislav-rangelov/bpm/commands"
 )
 
 const dependencyFilename = "bpm.json"
@@ -22,80 +23,46 @@ const vendorFolderName = "vendor"
 const gitFolderName = ".git"
 
 func main() {
-	ex, _ := os.Executable()
-
-	initCommand := flag.NewFlagSet("init", flag.ExitOnError)
-	installCommand := flag.NewFlagSet("install", flag.ExitOnError)
-	rebuildCommand := flag.NewFlagSet("rebuild", flag.ExitOnError)
-
-	if len(os.Args) == 1 {
-		showHelp()
-		return
-	}
-
-	switch os.Args[1] {
-	case "init":
-		initCommand.Parse(os.Args[2:])
-	case "install":
-		installCommand.Parse(os.Args[2:])
-	case "rebuild":
-		rebuildCommand.Parse(os.Args[2:])
-	default:
-		fmt.Printf("%q is not a valid command.\n", os.Args[1])
-		os.Exit(2)
-	}
 
 	var (
-		init    = initCommand.Parsed()
-		install = installCommand.Parsed()
-		rebuild = rebuildCommand.Parsed()
-		pDir    = flag.String("dir", "", "Root dir of project. Would pull all dependencies in $dir/vendor.")
+		c   = &commands.Commands{}
+		dir = ""
 	)
+	c.Name = "Basic Package Manager"
+	c.MainCommand = "bpm"
+	c.NewCommand("init", func() {
+		doInit(getCurrentDir())
+	}, "Creates a bpm.json file in the current directory and gets all dependencies.")
+	c.NewCommand("install", func() {
+		doInstall(getDir(&dir))
+	}, "Pulls configured packages and version.")
+	c.NewCommand("rebuild", func() {
+		doRebuild(getDir(&dir))
+	}, "Forgets all dependency data and pulls latest package versions.")
+	c.NewArg("dir", &dir, dir, "Root dir of project. Would pull all dependencies in $dir/vendor.")
 
-	flag.Parse()
-
-	if init {
-		if *pDir == "" {
-			*pDir = filepath.Dir(ex)
-		}
-		doInit(*pDir)
-		return
-	}
-
-	log.Printf("Working dir: %s\n", *pDir)
-
-	if install {
-		if *pDir == "" {
-			pDir = findPackageFile(filepath.Dir(ex))
-			if pDir == nil {
-				log.Panicf("No bpm.json repository found in folder or parent folders.\n")
-			}
-		}
-		doInstall(*pDir)
-	} else if rebuild {
-		if *pDir == "" {
-			*pDir = filepath.Dir(ex)
-		}
-		doRebuild(*pDir)
-	} else {
-		showHelp()
-	}
+	commands.HandleArgs(c)
 }
 
-func showHelp() {
-	fmt.Println("Basic Package Manager")
-	fmt.Println("=====================")
-	fmt.Print("Usage: bpm <command> [<args>]\n\n")
-	fmt.Println("Commands:")
-	fmt.Println("    init       Creates a bpm.json file in the current directory and gets all dependencies.")
-	fmt.Println("    install    Pulls configured packages and version.")
-	fmt.Print("    rebuild    Forgets all dependency data and pulls latest package versions.\n\n")
-	fmt.Println("Args:")
-	fmt.Println("    -dir       Root dir of project. Would pull all dependencies in $dir/vendor.")
+func getCurrentDir() string {
+	ex, _ := os.Executable()
+	return filepath.Dir(ex)
+}
+
+func getDir(dir *string) string {
+	if dir != nil {
+		return *dir
+	}
+	dir = findPackageFile(getCurrentDir())
+	if dir == nil {
+		log.Panicf("No git repository found in folder or parent folders.\n")
+	}
+	return *dir
 }
 
 func findPackageFile(dir string) *string {
 	for dir != "." {
+		println(dir)
 		if fileExists(filepath.Join(dir, dependencyFilename)) {
 			return &dir
 		}
@@ -114,10 +81,21 @@ func doInit(dir string) {
 		fmt.Printf("%s already exists: %s", dependencyFilename, depFile)
 		return
 	}
+	files := getAllSourceFiles(dir)
+	log.Printf("Found files: %d", len(*files))
+	imports := getAllImports(files)
+	packages := getImports(imports)
+	dependencies := installPackages(packages, dir)
+	data := bpmEntry{Dependencies: dependencies}
+	writeDataFile(&data)
 }
 
 func doInstall(dir string) {
-
+	depFile := filepath.Join(dir, dependencyFilename)
+	if !fileExists(depFile) {
+		fmt.Printf("%s does not exist: %s", dependencyFilename, depFile)
+		return
+	}
 }
 
 func doRebuild(dir string) {
