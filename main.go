@@ -9,6 +9,7 @@ import (
 	"go/token"
 	"io/ioutil"
 	"log"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -27,6 +28,7 @@ func main() {
 	var (
 		c   = &commands.Commands{}
 		dir = ""
+		pkg = ""
 	)
 	c.Name = "Basic Package Manager"
 	c.MainCommand = "bpm"
@@ -36,10 +38,14 @@ func main() {
 	c.NewCommand("install", func() {
 		doInstall(getDir(&dir))
 	}, "Pulls configured packages and version.")
+	c.NewCommand("update", func() {
+		doUpdate(getDir(&dir), pkg)
+	}, "Updates all or a specific package by pulling the latest commit on the specified branch.")
 	c.NewCommand("rebuild", func() {
 		doRebuild(getDir(&dir))
 	}, "Forgets all dependency data and pulls latest package versions.")
-	c.NewArg("dir", &dir, dir, "Root dir of project. Would pull all dependencies in $dir/vendor.")
+	c.NewArg("-d", &dir, getCurrentDir(), "Root dir of project. Would pull all dependencies in $dir/vendor.")
+	c.NewArg("-p", &pkg, "", "Execute the specified command for a specific dependency package.")
 
 	commands.HandleArgs(c)
 }
@@ -81,13 +87,33 @@ func doInit(dir string) {
 		fmt.Printf("%s already exists: %s", dependencyFilename, depFile)
 		return
 	}
+	pkg := getCurrentPackage(dir)
+	if pkg == "" {
+		return
+	}
+
+	dependencies := resolveDependencies(dir, pkg)
+
+	data := &bpmPackage{
+		Package:      pkg,
+		Dependencies: dependencies}
+	writeDataFile(data)
+}
+
+func resolveDependencies(dir string, pkg string) map[string]*bpmEntry {
 	files := getAllSourceFiles(dir)
 	log.Printf("Found files: %d", len(*files))
 	imports := getAllImports(files)
-	packages := getImports(imports)
+	packages := getImports(imports, pkg)
 	dependencies := installPackages(packages, dir)
-	data := bpmEntry{Dependencies: dependencies}
-	writeDataFile(&data)
+
+	for pkg, entry := range dependencies {
+		pkgDir := filepath.Join(dir, vendorFolderName, pkg)
+		log.Printf("Subpackage: %s", pkgDir)
+		entry.Dependencies = resolveDependencies(pkgDir, pkg)
+	}
+
+	return dependencies
 }
 
 func doInstall(dir string) {
@@ -96,26 +122,37 @@ func doInstall(dir string) {
 		fmt.Printf("%s does not exist: %s", dependencyFilename, depFile)
 		return
 	}
+	data := readDataFile(depFile)
+	pullPackages(data.Dependencies, dir)
+	writeDataFile(data)
+}
+
+func doUpdate(dir string, pkg string) {
+
 }
 
 func doRebuild(dir string) {
+	fmt.Printf("Working dir: %s\n", dir)
+	pkg := getCurrentPackage(dir)
+	if pkg == "" {
+		return
+	}
 	vendorDir := filepath.Join(dir, vendorFolderName)
 	removeDir(vendorDir)
-	files := getAllSourceFiles(dir)
-	log.Printf("Found files: %d", len(*files))
-	imports := getAllImports(files)
-	packages := getImports(imports)
-	dependencies := installPackages(packages, dir)
-	data := bpmEntry{Dependencies: dependencies}
-	writeDataFile(&data)
+
+	dependencies := resolveDependencies(dir, pkg)
+	data := &bpmPackage{
+		Package:      pkg,
+		Dependencies: dependencies}
+	writeDataFile(data)
 }
 
-func getAllImports(files *[]string) []*ast.ImportSpec {
+func getAllImports(files *[]string) map[string][]*ast.ImportSpec {
 	var (
 		bytes   []byte
 		err     error
 		f       *ast.File
-		imports = []*ast.ImportSpec{}
+		imports = make(map[string][]*ast.ImportSpec)
 	)
 	for _, fname := range *files {
 		if bytes, err = ioutil.ReadFile(fname); err != nil {
@@ -127,7 +164,7 @@ func getAllImports(files *[]string) []*ast.ImportSpec {
 			log.Panic(err)
 		}
 
-		imports = append(imports, f.Imports...)
+		imports[fname] = f.Imports
 	}
 	return imports
 }
@@ -161,22 +198,29 @@ func getAllSourceFiles(dir string) *[]string {
 	return &result
 }
 
-func getImports(arr []*ast.ImportSpec) *[]string {
+func getPackagePattern() *regexp.Regexp {
 	pattern, err := regexp.Compile("^([^/]+\\.[^.]{1,6}/[^/]+/[^/]+)")
 	if err != nil {
 		log.Panic(err)
 	}
+	return pattern
+}
 
+func getImports(importMap map[string][]*ast.ImportSpec, currentPkg string) *[]string {
+
+	pattern := getPackagePattern()
 	imports := make(map[string]*interface{}, 0)
 
-	for _, i := range arr {
-		val := (*i.Path).Value
-		val = strings.Trim(val, `"`)
-		if pattern.MatchString(val) {
-			val = pattern.FindString(val)
-			if _, ok := imports[val]; !ok {
-				log.Printf("Found package: %s", val)
-				imports[val] = nil
+	for fname, arr := range importMap {
+		for _, i := range arr {
+			val := (*i.Path).Value
+			val = strings.Trim(val, `"`)
+			if pattern.MatchString(val) {
+				val = pattern.FindString(val)
+				if _, ok := imports[val]; !ok {
+					log.Printf("Found package: %s in file %s", val, fname)
+					imports[val] = nil
+				}
 			}
 		}
 	}
@@ -184,9 +228,16 @@ func getImports(arr []*ast.ImportSpec) *[]string {
 	result := make([]string, 0)
 	for key := range imports {
 		key = strings.Trim(key, `"`)
-		result = append(result, key)
+		if key != currentPkg {
+			result = append(result, key)
+		}
 	}
 	return &result
+}
+
+type bpmPackage struct {
+	Package      string               `json:"package"`
+	Dependencies map[string]*bpmEntry `json:"dependencies"`
 }
 
 type bpmEntry struct {
@@ -207,7 +258,7 @@ func installPackages(packages *[]string, dir string) map[string]*bpmEntry {
 
 	dependencies := make(map[string]*bpmEntry, len(*packages))
 
-	channelLis := []chan channelResult{}
+	channelList := []chan channelResult{}
 
 	for _, filename := range *packages {
 
@@ -215,13 +266,13 @@ func installPackages(packages *[]string, dir string) map[string]*bpmEntry {
 		createDir(pkgDir)
 
 		c := make(chan channelResult, 1)
-		go pullAndGetEntry(c, filename, pkgDir)
-		channelLis = append(channelLis, c)
+		go clonePackage(c, filename, pkgDir)
+		channelList = append(channelList, c)
 	}
 
-	for _, c := range channelLis {
+	for _, c := range channelList {
 		result, ok := <-c
-		if ok {
+		if ok && result.entry != nil {
 			log.Printf("Dependency pulled: %s", result.pkg)
 			dependencies[result.pkg] = result.entry
 		}
@@ -230,11 +281,67 @@ func installPackages(packages *[]string, dir string) map[string]*bpmEntry {
 	return dependencies
 }
 
-func pullAndGetEntry(c chan channelResult, pkg string, pkgDir string) {
+func pullPackages(dependencies map[string]*bpmEntry, dir string) {
+
+	if dependencies == nil || len(dependencies) == 0 {
+		return
+	}
+
+	vendorDir := filepath.Join(dir, vendorFolderName)
+	createDir(vendorDir)
+
+	channelMap := make(map[string]chan error, 0)
+
+	for pkg, data := range dependencies {
+		pkgDir := filepath.Join(vendorDir, pkg)
+
+		c := make(chan error, 1)
+		go pullPackage(c, pkg, data, pkgDir)
+		channelMap[pkg] = c
+	}
+
+	for pkg, c := range channelMap {
+		err, ok := <-c
+		if ok {
+			if err != nil {
+				log.Panic(err)
+			}
+			log.Printf("Dependency pulled: %s", pkg)
+			data := dependencies[pkg]
+			pkgDir := filepath.Join(vendorDir, pkg)
+			pullPackages(data.Dependencies, pkgDir)
+		}
+	}
+}
+
+func pullPackage(c chan error, pkg string, entry *bpmEntry, pkgDir string) {
+
+	if !fileExists(pkgDir) {
+		createDir(pkgDir)
+	}
+
+	if !isGitRepo(pkgDir) {
+		cloneRepo(entry.URL, pkgDir)
+	}
+
+	pullRepo(entry, pkgDir)
+
+	c <- nil
+}
+
+func clonePackage(c chan channelResult, pkg string, pkgDir string) {
+	defer func() {
+		if r := recover(); r != nil {
+			fmt.Errorf("Couldn't clone package %s doe to error: %s", pkg, r)
+		}
+		c <- channelResult{
+			pkg:   pkg,
+			entry: nil}
+	}()
+
 	cloneURL := "https://" + pkg
 
-	log.Printf("Pulling package %s in %s...", cloneURL, pkgDir)
-	log.Println(cloneRepo(cloneURL, pkgDir))
+	cloneRepo(cloneURL, pkgDir)
 
 	branch := getCurrentBranch(pkgDir)
 	hash := getCurrentCommitHash(pkgDir)
@@ -269,27 +376,67 @@ func fileExists(filename string) bool {
 	return !os.IsNotExist(err)
 }
 
-func runCmd(dir *string, command string, args ...string) []byte {
+func runCmd(dir *string, getOutput bool, command string, args ...string) []byte {
 	var (
 		out []byte
 		err error
 	)
 	cmd := exec.Command(command, args...)
+	log.Printf("Command: %s %s", command, strings.Join(args, " "))
 	if dir != nil {
 		cmd.Dir = *dir
 	}
+	if !getOutput {
+		cmd.Stdin = os.Stdin
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		if err = cmd.Run(); err != nil {
+			log.Panic(err)
+		}
+		return make([]byte, 0)
+	}
+
 	if out, err = cmd.CombinedOutput(); err != nil {
 		log.Panic(err)
 	}
 	return out
 }
 
-func cloneRepo(url string, dir string) string {
-	return string(runCmd(nil, "git", "clone", url, dir))
+func pullRepo(entry *bpmEntry, pkgDir string) {
+
+	log.Printf("Pulling package %s in %s", entry.URL, pkgDir)
+
+	branch := getCurrentBranch(pkgDir)
+	if entry.Branch == "" {
+		entry.Branch = branch
+	}
+	if branch != entry.Branch {
+		checkoutBranch(pkgDir, entry.Branch)
+	}
+	commit := getCurrentCommitHash(pkgDir)
+	if entry.Commit == "" {
+		entry.Commit = commit
+	}
+	if commit != entry.Commit {
+		checkoutCommit(pkgDir, entry.Commit)
+	}
+}
+
+func checkoutBranch(pkgDir string, branch string) {
+	runCmd(&pkgDir, false, "git", "checkout", branch)
+}
+
+func checkoutCommit(pkgDir string, commit string) {
+	runCmd(&pkgDir, false, "git", "checkout", commit, ".")
+}
+
+func cloneRepo(url string, dir string) {
+	log.Printf("Cloning package %s in %s...", url, dir)
+	runCmd(nil, false, "git", "clone", url, dir)
 }
 
 func getCurrentBranch(dir string) string {
-	out := runCmd(&dir, "git", "branch")
+	out := runCmd(&dir, true, "git", "branch")
 	branch := string(regexp.MustCompile("\\* ([^\n]+)\n").Find(out))
 	branch = strings.TrimLeft(branch, "* ")
 	branch = strings.TrimRight(branch, "\n ")
@@ -297,12 +444,12 @@ func getCurrentBranch(dir string) string {
 }
 
 func getCurrentCommitHash(dir string) string {
-	hash := string(runCmd(&dir, "git", "rev-parse", "HEAD"))
+	hash := string(runCmd(&dir, true, "git", "rev-parse", "HEAD"))
 	hash = strings.TrimRight(hash, "\n ")
 	return hash
 }
 
-func jsonEncodeIndented(deps *bpmEntry) []byte {
+func jsonEncodeIndented(deps *bpmPackage) []byte {
 	buffer := bytes.Buffer{}
 	encoder := json.NewEncoder(&buffer)
 	encoder.SetIndent("", "  ")
@@ -312,12 +459,45 @@ func jsonEncodeIndented(deps *bpmEntry) []byte {
 	return buffer.Bytes()
 }
 
-func writeDataFile(data *bpmEntry) {
+func writeDataFile(data *bpmPackage) {
 	if err := ioutil.WriteFile(dependencyFilename, jsonEncodeIndented(data), os.ModeExclusive); err != nil {
 		log.Panic(err)
 	}
 }
 
+func readDataFile(filename string) *bpmPackage {
+	bytes, err := ioutil.ReadFile(filename)
+	if err != nil {
+		log.Panic(err)
+	}
+	data := bpmPackage{}
+	err = json.Unmarshal(bytes, &data)
+	if err != nil {
+		log.Panic(err)
+	}
+	return &data
+}
+
 func isGitRepo(dir string) bool {
 	return fileExists(filepath.Join(dir, gitFolderName))
+}
+
+func getCurrentPackage(dir string) string {
+	result := string(runCmd(&dir, true, "git", "remote", "get-url", "origin"))
+	u, err := url.Parse(result)
+	if err != nil {
+		fmt.Println("Could not resolve current repo origin: ", err.Error())
+		return ""
+	}
+	pkg := u.Hostname() + u.RawPath
+	pkg = strings.TrimSpace(pkg)
+	if strings.HasSuffix(pkg, ".git") {
+		pkg = pkg[:len(pkg)-4]
+	}
+	pattern := getPackagePattern()
+	if pattern.MatchString(pkg) {
+		return pattern.FindString(pkg)
+	}
+	fmt.Println("Repo origin is not a valid package: " + pkg)
+	return ""
 }
